@@ -1,195 +1,157 @@
+import os
 import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
+import anthropic
 
-# ==========================================
-# 1. 페이지 기본 설정
-# ==========================================
+# ------------------------------------------------------------------------------
+# 1. 페이지 기본 설정 및 스타일 정의
+# ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="텍스트 & 데이터 분석 대시보드",
-    page_icon="📊",
+    page_title="SNU AI Assistant",
+    page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ==========================================
+# Custom CSS 적용 (깔끔한 채팅 UI 스타일링)
+st.markdown(
+    """
+    <style>
+    .main-header {
+        font-size: 2.25rem;
+        font-weight: 700;
+        color: #1E3A8A;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1rem;
+        color: #4B5563;
+        margin-bottom: 1.5rem;
+    }
+    .stChatMessage {
+        border-radius: 8px;
+        padding: 0.75rem;
+        margin-bottom: 0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ------------------------------------------------------------------------------
 # 2. 세션 상태 초기화
-# ==========================================
-if "history" not in st.session_state:
-    st.session_state.history = []
+# ------------------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# ==========================================
-# 3. 헬퍼 함수 정의 (예외 처리 포함)
-# ==========================================
-def analyze_text(text: str) -> dict:
-    """입력된 텍스트를 분석하여 통계 수치를 반환하는 함수"""
-    try:
-        if not text or not text.strip():
-            raise ValueError("입력된 텍스트가 비어 있습니다.")
-
-        char_count = len(text)
-        char_count_no_spaces = len(text.replace(" ", "").replace("\n", "").replace("\t", ""))
-        words = text.split()
-        word_count = len(words)
-        lines = text.splitlines()
-        line_count = len([line for line in lines if line.strip()])
-
-        # 단어 빈도수 계산
-        word_freq = {}
-        for w in words:
-            clean_w = w.strip(".,!?\"'()[]{}").lower()
-            if clean_w:
-                word_freq[clean_w] = word_freq.get(clean_w, 0) + 1
-
-        freq_df = pd.DataFrame(list(word_freq.items()), columns=["단어", "빈도수"])
-        freq_df = freq_df.sort_values(by="빈도수", ascending=False).reset_index(drop=True)
-
-        return {
-            "success": True,
-            "char_count": char_count,
-            "char_count_no_spaces": char_count_no_spaces,
-            "word_count": word_count,
-            "line_count": line_count,
-            "freq_df": freq_df,
-            "error": None
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-# ==========================================
-# 4. 사이드바 영역
-# ==========================================
+# ------------------------------------------------------------------------------
+# 3. 사이드바 구성 (설정 및 옵션)
+# ------------------------------------------------------------------------------
 with st.sidebar:
-    st.title("⚙️ 설정 및 안내")
+    st.title("⚙️ 설정 (Settings)")
     st.markdown("---")
+
+    # API 키 입력받기 (Secrets에 설정된 키가 없거나 사용자가 직접 입력하고자 할 때)
+    default_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     
-    st.subheader("📌 사용 안내")
-    st.info(
-        "1. 중앙 텍스트 상자에 분석할 문장을 입력하세요.\n"
-        "2. **[텍스트 분석 실행]** 버튼을 클릭합니다.\n"
-        "3. 실시간 분석 결과와 단어 빈도 차트를 확인하세요."
+    user_api_key = st.text_input(
+        "Anthropic API Key",
+        value=default_api_key if default_api_key else "",
+        type="password",
+        help="Anthropic Console에서 발급받은 API 키를 입력하세요.",
     )
-    
+
     st.markdown("---")
-    st.subheader("📜 작업 기록")
-    if st.session_state.history:
-        st.write(f"총 **{len(st.session_state.history)}개**의 기록이 저장됨")
-        if st.button("기록 전체 삭제", type="secondary"):
-            st.session_state.history = []
-            st.rerun()
-    else:
-        st.caption("저장된 작업 기록이 없습니다.")
+    
+    # 모델 선택
+    selected_model = st.selectbox(
+        "사용할 AI 모델 선택",
+        options=[
+            "claude-3-5-sonnet-20241022",
+            "claude-3-haiku-20240307",
+            "claude-3-opus-20240229",
+        ],
+        index=0,
+    )
 
-# ==========================================
-# 5. 메인 레이아웃 영역
-# ==========================================
-st.title("📊 실시간 텍스트 & 데이터 분석 대시보드")
-st.caption("텍스트 데이터를 입력 받아 통계 지표와 시각화 차트를 즉시 생성합니다.")
+    # 파라미터 조절 Slider
+    temperature = st.slider("Temperature (창의성)", 0.0, 1.0, 0.7, 0.05)
+    max_tokens = st.slider("최대 토큰 수", 256, 4096, 2048, 128)
 
-st.markdown("---")
+    st.markdown("---")
+    
+    # 대화 기록 초기화 버튼
+    if st.button("🗑️ 대화 내용 초기화", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
 
-# 입력 섹션
-input_text = st.text_area(
-    label="분석할 텍스트를 입력하세요",
-    height=200,
-    placeholder="여기에 문단이나 텍스트 데이터를 붙여넣으세요...",
-    help="한글, 영어, 숫자 등 모든 문자열 지원"
+# ------------------------------------------------------------------------------
+# 4. 메인 화면 구성
+# ------------------------------------------------------------------------------
+st.markdown('<div class="main-header">🤖 서울대학교 AI Assistant</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Claude API 기반의 대화형 인공지능 서비스입니다. 질문을 입력하세요.</div>',
+    unsafe_allow_html=True,
 )
 
-col_btn1, col_btn2, _ = st.columns([1, 1, 4])
+# 과거 대화 메시지 출력
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-with col_btn1:
-    submit_button = st.button("🚀 텍스트 분석 실행", type="primary", use_container_width=True)
+# ------------------------------------------------------------------------------
+# 5. 사용자 입력 처리 및 API 호출
+# ------------------------------------------------------------------------------
+if prompt := st.chat_input("질문을 입력하세요..."):
+    # API 키 유효성 기본 확인
+    api_key_to_use = user_api_key.strip()
+    if not api_key_to_use:
+        st.error("⚠️ Anthropic API 키가 설정되지 않았습니다. 사이드바에 API 키를 입력해주세요.")
+        st.stop()
 
-with col_btn2:
-    clear_button = st.button("🗑️ 입력 초기화", use_container_width=True)
+    # 1) 사용자 입력 메시지 세션 저장 및 화면 표시
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-if clear_button:
-    st.rerun()
+    # 2) AI 응답 생성 처리 (스트리밍 및 예외 처리 포함)
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
 
-# ==========================================
-# 6. 실행 및 결과 처리
-# ==========================================
-if submit_button:
-    if not input_text.strip():
-        st.warning("⚠️ 분석할 텍스트를 입력한 후 실행 버튼을 눌러주세요.")
-    else:
-        with st.spinner("텍스트를 분석하는 중입니다..."):
-            result = analyze_text(input_text)
-            
-            if not result["success"]:
-                st.error(f"❌ 분석 중 오류가 발생했습니다: {result['error']}")
-            else:
-                st.success("✅ 분석이 완료되었습니다!")
-                
-                # 히스토리 기록 저장
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state.history.append({
-                    "timestamp": timestamp,
-                    "char_count": result["char_count"],
-                    "word_count": result["word_count"]
-                })
+        try:
+            # Anthropic 클라이언트 생성
+            client = anthropic.Anthropic(api_key=api_key_to_use)
 
-                # 요약 지표 카드 (Metrics)
-                st.markdown("### 📈 요약 지표")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric(label="전체 글자 수", value=f"{result['char_count']:,} 자")
-                m2.metric(label="공백 제외 글자 수", value=f"{result['char_count_no_spaces']:,} 자")
-                m3.metric(label="단어 수", value=f"{result['word_count']:,} 개")
-                m4.metric(label="문단/줄 수", value=f"{result['line_count']:,} 줄")
+            # API 호출 전달용 메시지 구성 (role, content 규격 준수)
+            api_messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ]
 
-                st.markdown("---")
+            # 스트리밍 방식 호출
+            with client.messages.stream(
+                model=selected_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=api_messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    full_response += text
+                    message_placeholder.markdown(full_response + "▌")
 
-                # 시각화 및 데이터 테이블 영역
-                col_chart, col_table = st.columns([3, 2])
+            # 최종 메시지 렌더링 (커서 제거)
+            message_placeholder.markdown(full_response)
 
-                with col_chart:
-                    st.markdown("### 📊 상위 단어 빈도수")
-                    top_df = result["freq_df"].head(10)
+            # 3) AI 응답 세션 저장
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-                    if not top_df.empty:
-                        fig = px.bar(
-                            top_df,
-                            x="빈도수",
-                            y="단어",
-                            orientation="h",
-                            text="빈도수",
-                            color="빈도수",
-                            color_continuous_scale="Viridis"
-                        )
-                        fig.update_layout(
-                            yaxis={"categoryorder": "total ascending"},
-                            xaxis_title="출현 횟수",
-                            yaxis_title="단어",
-                            margin=dict(l=20, r=20, t=30, b=20),
-                            height=380
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("시각화할 단어가 부족합니다.")
-
-                with col_table:
-                    st.markdown("### 📋 전체 단어 목록")
-                    st.dataframe(
-                        result["freq_df"],
-                        use_container_width=True,
-                        height=380,
-                        column_config={
-                            "단어": st.column_config.TextColumn("단어"),
-                            "빈도수": st.column_config.NumberColumn("출현 횟수", format="%d 회")
-                        }
-                    )
-
-# ==========================================
-# 7. 세션 기록 보기 (하단 Expander)
-# ==========================================
-if st.session_state.history:
-    st.markdown("---")
-    with st.expander("📂 이전 분석 세션 기록 확인"):
-        history_df = pd.DataFrame(st.session_state.history)
-        st.dataframe(history_df, use_container_width=True)
+        except anthropic.AuthenticationError:
+            st.error("❌ API 키 인증에 실패했습니다. 올바른 Anthropic API Key인지 확인해주세요.")
+        except anthropic.APIConnectionError:
+            st.error("📡 네트워크 연결에 실패했습니다. 인터넷 연결을 확인해주세요.")
+        except anthropic.RateLimitError:
+            st.error("⏳ API 요청 한도(Rate Limit)를 초과했습니다. 잠시 후 다시 시도해주세요.")
+        except anthropic.BadRequestError as e:
+            st.error(f"⚠️ 요청 형식 오류: {e.message}")
+        except Exception as e:
+            st.error(f"🚨 예상치 못한 오류가 발생했습니다: {str(e)}")
